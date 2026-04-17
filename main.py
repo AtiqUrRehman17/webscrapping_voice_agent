@@ -8,14 +8,15 @@ from collections import deque
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
-# ✅ Updated import (no deprecation)
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import Chroma
+from langchain_pinecone import PineconeVectorStore
 from langchain_core.documents import Document
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_classic.chains import RetrievalQA
 from langchain_core.prompts import PromptTemplate
+
+from pinecone import Pinecone
 
 # ✅ Selenium imports
 from selenium import webdriver
@@ -30,12 +31,17 @@ from selenium.webdriver.support import expected_conditions as EC
 # 0. Load environment
 # ──────────────────────────────────────────────
 load_dotenv()
+
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 if not GOOGLE_API_KEY:
     raise EnvironmentError("GOOGLE_API_KEY not found in .env file.")
 
-CHROMA_DIR = "./chroma_db"
-COLLECTION = "website_rag"
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
+if not PINECONE_API_KEY:
+    raise EnvironmentError("PINECONE_API_KEY not found in .env file.")
+
+PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "web-voice")
+PINECONE_ENVIRONMENT = os.getenv("PINECONE_ENVIRONMENT", "us-east-1")
 
 # ──────────────────────────────────────────────
 # 1. SELENIUM DRIVER
@@ -71,48 +77,36 @@ def clean_text(text: str) -> str:
 def scrape_page(driver, url: str):
     try:
         driver.get(url)
-
-        # wait for page load
         WebDriverWait(driver, 10).until(
             EC.presence_of_element_located((By.TAG_NAME, "body"))
         )
-
-        # scroll to load lazy content
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
         time.sleep(2)
-
         soup = BeautifulSoup(driver.page_source, "html.parser")
 
     except Exception as e:
         print(f"  [WARN] Failed {url}: {e}")
         return "", [], []
 
-    # remove noise
     for tag in soup(["script", "style", "noscript", "head",
                      "nav", "footer", "aside", "form", "iframe"]):
         tag.decompose()
 
     text = clean_text(soup.get_text(separator=" "))
 
-    # links
     links = []
     for a in soup.find_all("a", href=True):
         href = a["href"].strip()
-
         if href.startswith(("#", "mailto:", "tel:", "javascript:")):
             continue
-
         abs_href = urljoin(url, href).split("#")[0]
-
         if is_same_domain(url, abs_href):
             links.append(abs_href)
 
-    # images
     images = []
     for img in soup.find_all("img"):
         alt = img.get("alt", "").strip()
         src = img.get("src", "").strip()
-
         if alt:
             images.append(f"[IMAGE: {alt}]")
         elif src:
@@ -125,14 +119,12 @@ def crawl_website(start_url: str, max_pages: int = 30):
     print("\nStarting crawl:", start_url)
 
     driver = get_driver()
-
     visited = set()
     queue = deque([start_url])
     docs = []
 
     while queue and len(visited) < max_pages:
         url = queue.popleft()
-
         if url in visited:
             continue
 
@@ -140,7 +132,6 @@ def crawl_website(start_url: str, max_pages: int = 30):
         visited.add(url)
 
         text, links, images = scrape_page(driver, url)
-
         if not text:
             continue
 
@@ -157,15 +148,14 @@ def crawl_website(start_url: str, max_pages: int = 30):
                 queue.append(link)
 
     driver.quit()
-
     print(f"Crawl complete. Pages scraped: {len(docs)}")
     return docs
 
 # ──────────────────────────────────────────────
-# 3. CHUNKING
+# 3. CHUNKING  ✅ Change 2: chunk_size=1000, chunk_overlap=200
 # ──────────────────────────────────────────────
 
-def chunk_documents(docs, chunk_size=500, chunk_overlap=50):
+def chunk_documents(docs, chunk_size=1000, chunk_overlap=200):
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap
@@ -175,7 +165,7 @@ def chunk_documents(docs, chunk_size=500, chunk_overlap=50):
     return chunks
 
 # ──────────────────────────────────────────────
-# 4. EMBEDDINGS + DB
+# 4. EMBEDDINGS + PINECONE
 # ──────────────────────────────────────────────
 
 def get_embedding_model():
@@ -186,38 +176,54 @@ def get_embedding_model():
     )
 
 
+def get_pinecone_index():
+    pc = Pinecone(api_key=PINECONE_API_KEY)
+    return pc.Index(PINECONE_INDEX_NAME)
+
+
 def build_vector_store(chunks, embeddings):
-    vectordb = Chroma.from_documents(
+    print("Uploading embeddings to Pinecone...")
+    vectordb = PineconeVectorStore.from_documents(
         documents=chunks,
         embedding=embeddings,
-        persist_directory=CHROMA_DIR,
-        collection_name=COLLECTION
+        index_name=PINECONE_INDEX_NAME,
+        pinecone_api_key=PINECONE_API_KEY,
     )
-    vectordb.persist()
+    print("Embeddings stored in Pinecone successfully.")
     return vectordb
 
 
 def load_vector_store(embeddings):
-    return Chroma(
-        persist_directory=CHROMA_DIR,
-        embedding_function=embeddings,
-        collection_name=COLLECTION
+    print("Loading existing Pinecone index...")
+    return PineconeVectorStore(
+        index_name=PINECONE_INDEX_NAME,
+        embedding=embeddings,
+        pinecone_api_key=PINECONE_API_KEY,
     )
 
 # ──────────────────────────────────────────────
-# 5. QA
+# 5. QA  ✅ Change 1: Improved anti-hallucination RAG prompt
 # ──────────────────────────────────────────────
 
 RAG_PROMPT = PromptTemplate(
     input_variables=["context", "question"],
-    template="""
-Use ONLY the context below.
+    template="""You are a precise question-answering assistant. Your job is to answer the user's question using ONLY the information provided in the context below.
 
-Context:
+STRICT RULES you must follow:
+1. Answer ONLY using facts explicitly stated in the context. Do not add any information from your own training or general knowledge.
+2. If the context does not contain enough information to answer the question fully, say: "I don't have enough information in the provided content to answer this fully." Then share only what the context does support.
+3. If the context contains NO relevant information at all, say: "The provided content does not contain information about this topic." Do not attempt to answer.
+4. Never guess, assume, or infer details that are not clearly written in the context.
+5. Do not say things like "based on general knowledge" or "typically" or "usually" — every sentence in your answer must be traceable to the context.
+6. Keep your answer clear, concise, and directly relevant to the question.
+
+CONTEXT:
 {context}
 
-Question: {question}
-Answer:
+QUESTION:
+{question}
+
+ANSWER (based strictly on the context above):
 """
 )
 
@@ -258,10 +264,8 @@ def interactive_qa(chain):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--url", type=str)
-    parser.add_argument("--max-pages", type=int, default=10)
+    parser.add_argument("--max-pages", type=int, default=5)
     parser.add_argument("--load-existing", action="store_true")
-
     args = parser.parse_args()
 
     embeddings = get_embedding_model()
@@ -269,11 +273,12 @@ def main():
     if args.load_existing:
         vectordb = load_vector_store(embeddings)
     else:
-        if not args.url:
-            raise ValueError("Provide --url")
+        url = input("Enter the website URL to scrape: ").strip()
+        if not url:
+            print("No URL provided. Exiting.")
+            return
 
-        docs = crawl_website(args.url, args.max_pages)
-
+        docs = crawl_website(url, args.max_pages)
         if not docs:
             print("No data scraped.")
             return
